@@ -1,0 +1,297 @@
+#version 460
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(std430,binding=0)buffer Aa{vec2 audioBuffer[];};
+layout(location = 0) uniform int offs;
+
+const float pi=acos(-1.);
+const float tau=pi*2.;
+
+const float BEAT_DUR=60./90.;
+mat2 rot_(float a) {return mat2(cos(a),-sin(a),sin(a),cos(a));}
+vec3 cyclic(vec3 p, float pers, float lacu) {
+  vec4 sum = vec4(0);
+
+  for (int i = 0; i ++ < 5;) {
+    //p *= rot;
+    p.yz *= rot_(4.5);
+    p.xy *= rot_(1.5);
+    p += sin(p.zxy);
+    sum += vec4(cross(cos(p), sin(p.yzx)), 1);
+    sum /= pers;
+    p *= lacu;
+  }
+
+
+  return sum.xyz / sum.w;
+}
+vec3 hash( uvec3 x )
+{
+    x = ((x>>8U)^x.yzx)*1103773245U;
+    x = ((x>>8U)^x.yzx)*1103773245U;
+    x = ((x>>8U)^x.yzx)*1103773245U;
+
+    return vec3(x)*(1.0/float(0xffffffffU));
+}
+vec3 hash3f( vec3 x )
+{
+    return hash(uvec3(x*66456.85725));
+}
+uint hashi_( uint x) {
+    x ^= x >> 16;
+    x *= 0x7feb352dU;
+    x ^= x >> 15;
+    x *= 0x846ca68bU;
+    x ^= x >> 16;
+    return x;
+}
+float expease(float n, float deg) {
+    return n>0.0?1.0-exp(-n*deg):0.0;
+}
+float bass_pat[20] = float[](1.,0.,0.,0.,1., 1.,0.,1.,0.,0., 0.,0.,0.,0.,1., 1.,0.,1.,0.,0.);
+float kick_pat[20] = float[](1.,0.,0.,0.,0., 0.,0.,1.,0.,0., 0.,0.,0.,0.,0., 0.,0.,0.,0.,0.);
+
+vec2 spray( float t, float freq, float spread, float seed, float interval, int count) {
+  float grainLength = float(count) * interval;
+  vec2 sum = vec2(0);
+  for(float i = 0; i < count; i++) {
+    vec3 dice = hash3f(vec3(i, floor((float(t) -interval * i) / grainLength), seed));
+        vec2 ph = 6.283 * vec2(freq * t * exp2(spread * sqrt(-2 * log(dice.x)) * vec2(cos(6.283*dice.y), sin(6.283*dice.y))) + dice.xy);
+    sum += 
+            2 * 
+            smoothstep(0., .5, mod(float(t) -interval * i, grainLength) / grainLength) * 
+            smoothstep(1., .5, mod(float(t) -interval * i, grainLength) / grainLength) * 
+            vec2(sin(ph.x),sin(ph.y));
+  }
+  return sum / float(count);
+}
+
+float n2p(float n) {
+  return 440.0*pow(2.,n/12.);
+}
+
+void main() {
+    int id = int(gl_GlobalInvocationID.x)+ int(offs);
+    //seed = uint(id)*7745u;
+
+    float time = float(id)/float(44100);
+    float mt = time/BEAT_DUR;
+
+    float ltime = fract(time/BEAT_DUR/20./4.)*BEAT_DUR*20.*4.;
+    
+    vec2 audio = vec2(0);
+    vec2 sidechain = vec2(0);
+
+    vec2 bell = vec2(0);
+    { // bell thingy
+        float t = fract(mt*4.);
+        float env = exp(-t*6.) * smoothstep(0.0, 0.001, t) * smoothstep(0.0, 0.1, 1.-t);
+
+        float note = 7.;
+        float wave = sin(n2p(note)*tau*ltime);
+        vec2 vol = sin((floor(mt))*tau)*.5+.5+cyclic(vec3(floor(mt*4.)*6.),1.,1.).xy*.2;
+
+        bell = vec2(wave)*env*vol;
+    }
+
+    vec2 pad=vec2(0);
+    { // pad 
+        float interval = .15;
+        for (int instance=0; instance<5; instance++) {
+            float instance_t = ltime - interval*(sin(float(instance)+ltime*cos(float(instance))*.12));
+            float instance_mt = instance_t/BEAT_DUR;
+            vec2 rand_pan = cyclic(vec3(ltime,float(instance),0.),1.,1.).xy*.7;
+
+            float t = fract(instance_mt/5.);
+            float env = smoothstep(0.0, 0.2, t) * smoothstep(0.0, 0.6, 1.-t);
+            float lfo = .9;
+
+            float mel[16] = float[](-10.,-5. ,-2., 2.,
+                        -15.,-12.,-7.,-3.,
+                        -10.,-3. , 0., 5.,
+                            -7., 2. , 5., 9.);
+            vec2 wave=vec2(0);
+            for(int j=0; j<4; j++) {
+                float note =  mel[j+int(mod(floor(instance_mt/5.),4.))*4];
+                for(int i=0; i<32; i++) {
+                    float perc = float(i)/32.;
+                    vec2 dist = vec2(float(i))/(vec2(1000.)+vec2(cos(lfo*tau*instance_t),sin(lfo*tau*instance_t))*500.);
+                    vec2 n = dist+n2p(note)*instance_t;
+                    wave += vec2(
+                        cyclic(vec3(cos(n.x*tau),sin(n.x*tau),instance_t*.3), 11., 1.).x,
+                        cyclic(vec3(cos(n.y*tau),sin(n.y*tau),instance_t*.3), 11., 1.).y
+                    )*(1.-perc);
+                }
+            }
+            wave /= 32.*4.;
+
+            pad += wave*env*rand_pan *.8;
+        }
+        pad = tanh(pad*3.);
+    }
+
+    vec2 sprinkle=vec2(0);
+    { // sprinkle 
+        float mel[16] = float[](0.,2.,7.,10.,
+                       0.,5.,7., 9.,
+                       0.,2.,5., 9.,
+                       3.,5.,9.,10.);
+        vec2 wave=vec2(0);
+        for(int j=0; j<20; j++) {
+            float t = fract(mt/5.+j/20.);
+            float env = exp(-t*6.) * smoothstep(0.0, 0.001, t) * smoothstep(0.0, 0.6, 1.-t);
+            float note =  mel[hashi_(uint(j+floor(mt/5.)*367.))%4+int(mod(floor(mt/5.),4.))*4]+12*(hashi_(uint(j+floor(mt/5.)*266.))%3);
+            float n = n2p(note)*ltime;
+            wave += cyclic(vec3(cos(n*tau),sin(n*tau),ltime*.6), .1, 1.).xy*env*(200./n2p(note));
+        }
+
+        sprinkle = wave;
+    }
+
+    vec2 kick=vec2(0);
+    { // kick
+        float t = fract(mt*4.); 
+        float env = exp(-t*4.) * smoothstep(0.0, 0.001, t) * smoothstep(0.0, 0.1, 1.-t);
+        
+        float wave = tanh(sin(70.*ltime-expease(t,4.)*60.)*mix(5.,2.,t));
+        float vol = kick_pat[int(mod(floor(mt*4.),5.*4.))];
+
+        kick = vec2(wave)*env*vol;
+        sidechain+=exp(-t*12.)*vol;
+    }
+
+    vec2 bass=vec2(0);
+    { // bass
+        float t = fract(mt*4.); float env = exp(-t*4.) * smoothstep(0.0, 0.001, t) * smoothstep(0.0, 0.1, 1.-t);
+        
+        float mel[4] = float[](-17., -12., -7., -5.);
+        float note =  mel[int(cyclic(vec3(floor(mt*4.)*11.+3.),1.,1.).x*8.)%4]-12.;
+        float wave = tanh(sin(n2p(note)*tau*ltime + sin(220.*ltime)*pow(sin(3.*ltime)*.5+.5,9.)*1.6)*12.);
+        float vol = bass_pat[int(mod(floor(mt*4.),5.*4.))]+cyclic(vec3(floor(mt*4.)*5.),1.,1.).x*.1;
+
+        bass = vec2(wave)*env*vol;
+    }
+
+    vec2 crash=vec2(0);
+    { // crash/ohat
+        float t = fract(mt);
+        float env = exp(-t*5.5) * smoothstep(0.0, 0.001, t) * smoothstep(0.0, 0.1, 1.-t);
+        vec2 wave = cyclic(vec3(ltime)*188888., 1.2, .7).xy;
+        crash = wave*env*vec2(1.,.9);
+    }
+
+    vec2 snare=vec2(0);
+    { // snare
+        float pat[5] = float[](0.,1.,0.,0.,1.);
+        {
+            float t = fract(mt); float env = exp(-t*22.) * smoothstep(0.0, 0.005, t) * smoothstep(0.0, 0.1, 1.-t);
+
+            vec2 wave = tanh(mix(
+                spray(time, 1000., .8, 1., 1., 64),
+                cyclic(vec3(ltime)*18888., .9, .4).xy,
+                expease(t,2.)
+            )*18.);
+            float vol = pat[int(mod(floor(mt),5.))];
+
+            snare+=wave*vol*env*vec2(.8,1.);
+        }
+
+        { // snare reverb
+            float t = fract(mt-.04); float env = exp(-t*8.) * smoothstep(0.0, 0.2, t) * smoothstep(0.0, 0.1, 1.-t);
+
+            vec2 wave = tanh(
+                cyclic(vec3(ltime)*22222., 1.6, .5).xy
+            *18.);
+            float vol = pat[int(mod(floor(mt),5.))];
+
+            snare+=wave*vol*env*.15*vec2(.6,1.);
+        }
+    }
+
+    vec2 hats=vec2(0);
+    { // hats
+        float t = fract(mt+0.5); float env = exp(-t*18.) * smoothstep(0.0, 0.001, t) * smoothstep(0.0, 0.1, 1.-t);
+
+        vec2 wave = tanh(spray(ltime, 9900., .8, 3., 1., 64)*4.);
+        float vol = fract(floor(mt+0.5)*11.+.3)*.5+.5;
+
+        hats=wave*env*vol*vec2(1.,.4);
+    }
+
+    vec2 reese=vec2(0);
+    { // reeses cup
+        float t = fract(mt/5.); 
+        
+        float mel[8] = float[8](-5.,0.,-9.,-7., -5.,3.,0.,2.);
+        float note = mel[int(floor(mt/5.))%8]-36.;
+        float n = n2p(note)*tau*ltime;
+        vec2 wave = tanh(cyclic(vec3(cos(n), sin(n), ltime), 1., 1.).xy*12.);
+
+        reese=wave;
+    }
+    
+    float sec = mt/20.;
+    if (sec<1.) {
+        audio += bell*.2;
+    } else if (sec<2.) {
+        audio += bell*.2;
+        audio += bass*.2;
+    } else if (sec<4.) {
+        audio += bell*mix(.2,.0,step(3.+7./8.,sec));
+        audio += bass*.2;
+        audio += pad*.25;
+        audio += crash*mix(.1*clamp((sec-2.)/1.75,0.,1.),.0,step(3.+7./8.,sec));
+    } else if (sec<6.) {
+        audio += kick*.3;
+        audio += bell*.2;
+        audio += reese*(.05*(1.-sidechain*.8));
+        audio += pad*.25;
+        audio += crash*.1;
+        audio += snare*.2;
+        audio += hats*.07;
+    } else if (sec<8.) {
+        audio += kick*.3;
+        audio += bell*.2;
+        audio += sprinkle*.06*pow(clamp((sec-6.)/2.,0.,1.),2.);
+        audio += snare*.2;
+    } else if (sec<9.) {
+        audio += kick*.3;
+        audio += bell*.2;
+        audio += pad*.2;
+        audio += crash*mix(.1*pow(clamp((sec-8.)/.75,0.,1.),1.6),.0,step(8.+3./4.,sec));
+        audio *= step(sec,8.+3./4.);
+        audio += sprinkle*.06;
+        audio += snare*.2;
+    } else if (sec<11.) {
+        audio += kick*.3;
+        audio += bass*(.25*(1.-sidechain*.6));
+        audio += pad*.20;
+        audio += sprinkle*.06;
+        audio += crash*.05;
+        audio += snare*.2;
+        audio += hats*.1*pow(clamp((sec-9.)/2.,0.,1.),2.3);
+    } else if (sec<13.) {
+        audio += kick*.3;
+        audio += bell*.2*pow(clamp((sec-11.)/2.,0.,1.),1.1);
+        audio += bass*(.25*(1.-sidechain*.6));
+        audio += pad*.20;
+        audio += sprinkle*.06;
+        audio += crash*.05;
+        audio += snare*.2;
+        audio += hats*.1;
+    } else if (sec<14.) {
+        audio += sprinkle*.06*pow(clamp((14.-sec)/1.,0.,1.),.7);
+        audio += bass*.25;
+        audio += hats*.1;
+    } else if (sec<14.+3./20.) {
+        audio += bass*.25;
+    }
+
+    audio = tanh(audio*1.8);
+    audio *= mix(1.,mix(1.,.85,clamp((sec-8.)/1.,0.,1.)),step(sec,9.));
+    audio = max(vec2(-1),min(vec2(1),audio));
+
+    audioBuffer[id] = audio;
+}
+
